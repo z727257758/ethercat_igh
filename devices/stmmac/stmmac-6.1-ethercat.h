@@ -9,7 +9,7 @@
 #ifndef __STMMAC_H__
 #define __STMMAC_H__
 
-#define STMMAC_RESOURCE_NAME   "ec_stmmaceth"
+#define STMMAC_RESOURCE_NAME   "stmmaceth"
 
 #include <linux/clk.h>
 #include <linux/hrtimer.h>

@@ -28,7 +28,10 @@
 LSMOD="@kmoddir@/lsmod"
 MODPROBE="@kmoddir@/modprobe"
 RMMOD="@kmoddir@/rmmod"
-MODINFO="@kmoddir@/modinfo"
+MODINFO="$(command -v modinfo 2>/dev/null || true)"
+if [ -z "${MODINFO}" ] && [ -x "@kmoddir@/modinfo" ]; then
+    MODINFO="@kmoddir@/modinfo"
+fi
 IP="@ipcmd@"
 
 ETHERCAT="@bindir@/ethercat"
@@ -52,6 +55,19 @@ fi
 
 # shellcheck source=/etc/ethercat.conf
 . ${ETHERCAT_CONFIG}
+
+EC_STMMAC_ARGS=${EC_STMMAC_ARGS:-}
+
+#------------------------------------------------------------------------------
+
+module_exists() {
+    if [ -n "${MODINFO}" ] && [ -x "${MODINFO}" ]; then
+        ${MODINFO} "$1" > /dev/null 2>&1
+        return $?
+    fi
+
+    ${MODPROBE} ${MODPROBE_FLAGS} -n "$1" > /dev/null 2>&1
+}
 
 #------------------------------------------------------------------------------
 
@@ -77,6 +93,40 @@ parse_mac_address() {
             exit 1
         fi
     fi
+}
+
+#------------------------------------------------------------------------------
+
+unload_native_stmmac_stack() {
+    local module
+
+    # Rockchip boards usually bind the native GMAC through dwmac_rk, which in
+    # turn holds stmmac_platform and stmmac. Unload the stack from leaf to root
+    # before inserting ec_stmmac, otherwise the native driver can keep the
+    # device bound and ec_stmmac never takes ownership.
+    for module in dwmac_rk stmmac_platform stmmac; do
+        ${RMMOD} "${module}" 2> /dev/null || true
+    done
+
+    for module in dwmac_rk stmmac_platform stmmac; do
+        if ${LSMOD} | grep -q "^${module} "; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
+
+restore_native_stmmac_stack() {
+    # dwmac_rk is the board-specific leaf driver and will pull its stmmac
+    # dependencies back in automatically when available.
+    if ${MODPROBE} ${MODPROBE_FLAGS} dwmac_rk 2> /dev/null; then
+        return 0
+    fi
+
+    ${MODPROBE} ${MODPROBE_FLAGS} stmmac
 }
 
 #------------------------------------------------------------------------------
@@ -132,23 +182,46 @@ start)
     # check for modules to replace
     for MODULE in ${DEVICE_MODULES}; do
         ECMODULE=ec_${MODULE}
-        if ! ${MODINFO} "${ECMODULE}" > /dev/null; then
+        if ! module_exists "${ECMODULE}"; then
             continue # ec_* module not found
         fi
 
         if [ "${MODULE}" != "generic" ] && [ "${MODULE}" != "ccat" ]; then
-            # unload standard module and check if unloading was successful
-            ${RMMOD} "${MODULE}" 2> /dev/null || true
-            if ${LSMOD} | grep "^${MODULE} " > /dev/null; then
-                # could not unload module
-                ${RMMOD} ${LOADED_MODULES}
-                exit 1
+            if [ "${MODULE}" = "stmmac" ]; then
+                if ! unload_native_stmmac_stack; then
+                    ${RMMOD} ${LOADED_MODULES}
+                    exit 1
+                fi
+            else
+                # unload standard module and check if unloading was successful
+                ${RMMOD} "${MODULE}" 2> /dev/null || true
+                if ${LSMOD} | grep "^${MODULE} " > /dev/null; then
+                    # could not unload module
+                    ${RMMOD} ${LOADED_MODULES}
+                    exit 1
+                fi
             fi
         fi
 
-        if ! ${MODPROBE} ${MODPROBE_FLAGS} "${ECMODULE}"; then
+        if [ "${MODULE}" = "stmmac" ] && [ -n "${EC_STMMAC_ARGS}" ]; then
+            if ! ${MODPROBE} ${MODPROBE_FLAGS} "${ECMODULE}" ${EC_STMMAC_ARGS}; then
+                if [ "${MODULE}" != "generic" ] && [ "${MODULE}" != "ccat" ]; then
+                    if [ "${MODULE}" = "stmmac" ]; then
+                        restore_native_stmmac_stack || true
+                    else
+                        ${MODPROBE} ${MODPROBE_FLAGS} "${MODULE}" # try to restore
+                    fi
+                fi
+                ${RMMOD} ${LOADED_MODULES}
+                exit 1
+            fi
+        elif ! ${MODPROBE} ${MODPROBE_FLAGS} "${ECMODULE}"; then
             if [ "${MODULE}" != "generic" ] && [ "${MODULE}" != "ccat" ]; then
-                ${MODPROBE} ${MODPROBE_FLAGS} "${MODULE}" # try to restore
+                if [ "${MODULE}" = "stmmac" ]; then
+                    restore_native_stmmac_stack || true
+                else
+                    ${MODPROBE} ${MODPROBE_FLAGS} "${MODULE}" # try to restore
+                fi
             fi
             ${RMMOD} ${LOADED_MODULES}
             exit 1
@@ -181,7 +254,11 @@ stop)
         if [ "${MODULE}" == "generic" ] || [ "${MODULE}" == "ccat" ]; then
             continue
         fi
-        ${MODPROBE} ${MODPROBE_FLAGS} "${MODULE}"
+        if [ "${MODULE}" = "stmmac" ]; then
+            restore_native_stmmac_stack
+        else
+            ${MODPROBE} ${MODPROBE_FLAGS} "${MODULE}"
+        fi
     done
 
     # bring down all updown interfaces

@@ -320,7 +320,7 @@ static void stmmac_clk_csr_set(struct stmmac_priv *priv)
 {
 	u32 clk_rate;
 
-	clk_rate = clk_get_rate(priv->plat->stmmac_clk);
+	clk_rate = clk_get_rate(priv->plat->pclk);
 
 	/* Platform provided default clk_csr would be assumed valid
 	 * for all other cases except for the below mentioned ones.
@@ -1157,12 +1157,16 @@ static void stmmac_check_pcs_mode(struct stmmac_priv *priv)
 static int stmmac_init_phy(struct net_device *dev)
 {
 	struct stmmac_priv *priv = netdev_priv(dev);
+	struct phy_device *phydev = NULL;
 	struct fwnode_handle *phy_fwnode;
 	struct fwnode_handle *fwnode;
 	int ret;
 
 	if (!phylink_expects_phy(priv->phylink))
 		return 0;
+
+	if (priv->plat->integrated_phy_power)
+		ret = priv->plat->integrated_phy_power(priv->plat->bsp_priv, true);
 
 	fwnode = of_fwnode_handle(priv->plat->phylink_node);
 	if (!fwnode)
@@ -1178,7 +1182,6 @@ static int stmmac_init_phy(struct net_device *dev)
 	 */
 	if (!phy_fwnode || IS_ERR(phy_fwnode)) {
 		int addr = priv->plat->phy_addr;
-		struct phy_device *phydev;
 
 		if (addr < 0) {
 			netdev_err(priv->dev, "no phy found\n");
@@ -1191,13 +1194,37 @@ static int stmmac_init_phy(struct net_device *dev)
 			return -ENODEV;
 		}
 
+		netdev_info(priv->dev,
+			    "attaching PHY via addr lookup: bus_id=%d phy_addr=%d phy_id=0x%08x interface=%d drv=%s\n",
+			    priv->plat->bus_id, phydev->mdio.addr, phydev->phy_id,
+			    priv->plat->phy_interface,
+			    phydev->drv ? phydev->drv->name : "unbound");
 		ret = phylink_connect_phy(priv->phylink, phydev);
 	} else {
+		phydev = fwnode_phy_find_device(phy_fwnode);
 		fwnode_handle_put(phy_fwnode);
+		if (phydev) {
+			netdev_info(priv->dev,
+			    "attaching PHY via fwnode: bus_id=%d phy_addr=%d phy_id=0x%08x interface=%d drv=%s\n",
+			    priv->plat->bus_id, phydev->mdio.addr, phydev->phy_id,
+			    priv->plat->phy_interface,
+			    phydev->drv ? phydev->drv->name : "unbound");
+			phy_device_free(phydev);
+		} else {
+			netdev_warn(priv->dev,
+			    "phy-handle resolved but no PHY device is registered yet for bus_id=%d interface=%d\n",
+			    priv->plat->bus_id, priv->plat->phy_interface);
+		}
+
 		ret = phylink_fwnode_phy_connect(priv->phylink, fwnode, 0);
 	}
 
-	if (!get_ecdev(priv) && !priv->plat->pmt) {
+	if (ret)
+		netdev_err(priv->dev,
+		   "PHY attach failed: bus_id=%d interface=%d ret=%d\n",
+		   priv->plat->bus_id, priv->plat->phy_interface, ret);
+
+	if (!priv->plat->pmt) {
 		struct ethtool_wolinfo wol = { .cmd = ETHTOOL_GWOL };
 
 		phylink_ethtool_get_wol(priv->phylink, &wol);
@@ -2926,6 +2953,10 @@ static void stmmac_check_ether_addr(struct stmmac_priv *priv)
 		stmmac_get_umac_addr(priv, priv->hw, addr, 0);
 		if (is_valid_ether_addr(addr))
 			eth_hw_addr_set(priv->dev, addr);
+		else if (likely(priv->plat->get_eth_addr))
+			priv->plat->get_eth_addr(priv->plat->bsp_priv, addr);
+		if (is_valid_ether_addr(addr))
+			eth_hw_addr_set(priv->dev, addr);
 		else
 			eth_hw_addr_random(priv->dev);
 		dev_info(priv->device, "device MAC address %pM\n",
@@ -3980,6 +4011,9 @@ static int stmmac_release(struct net_device *dev)
 	if (get_ecdev(priv)) {
 		rtnl_unlock();
 	}
+
+	if (priv->plat->integrated_phy_power)
+		priv->plat->integrated_phy_power(priv->plat->bsp_priv, false);
 
 	stmmac_disable_all_queues(priv);
 
@@ -6896,12 +6930,18 @@ static void ec_kick_watchdog(struct irq_work *work)
 void ec_poll(struct net_device *netdev)
 {
 	struct stmmac_priv *priv = netdev_priv(netdev);
+	bool carrier_up;
 	int i;
 	int budget = 128;
 	u32 maxq;
 
 	if (!get_ecdev(priv))
 		return;
+
+	carrier_up = netif_carrier_ok(netdev);
+	if (carrier_up != ecdev_get_link(get_ecdev(priv)))
+		ecdev_set_link(get_ecdev(priv), carrier_up);
+
 	maxq = max(priv->plat->rx_queues_to_use, priv->plat->tx_queues_to_use);
 
 	if (jiffies - priv->ec_watchdog_jiffies >= 2 * HZ) {
@@ -7496,10 +7536,6 @@ int stmmac_ec_dvr_probe(struct device *device,
 	if (priv->plat->dump_debug_regs)
 		priv->plat->dump_debug_regs(priv->plat->bsp_priv);
 
-	/* Let pm_runtime_put() disable the clocks.
-	 * If CONFIG_PM is not enabled, the clocks will stay powered.
-	 */
-	pm_runtime_put(device);
 	if (get_ecdev(priv)) {
 		init_irq_work(&priv->ec_watchdog_kicker, ec_kick_watchdog);
 		ret = ecdev_open(get_ecdev(priv));
@@ -7508,6 +7544,11 @@ int stmmac_ec_dvr_probe(struct device *device,
 			goto error_netdev_register;
 		}
 	}
+
+	/* Let pm_runtime_put() disable the clocks.
+	 * If CONFIG_PM is not enabled, the clocks will stay powered.
+	 */
+	pm_runtime_put(device);
 
 	return ret;
 
@@ -7621,6 +7662,8 @@ int stmmac_suspend(struct device *dev)
 		stmmac_pmt(priv, priv->hw, priv->wolopts);
 		priv->irq_wake = 1;
 	} else {
+		if (priv->plat->integrated_phy_power)
+			priv->plat->integrated_phy_power(priv->plat->bsp_priv, false);
 		stmmac_mac_set(priv, priv->ioaddr, false);
 		pinctrl_pm_select_sleep_state(priv->device);
 	}
@@ -7722,6 +7765,8 @@ int stmmac_resume(struct device *dev)
 		/* reset the phy so that it's ready */
 		if (priv->mii)
 			stmmac_mdio_reset(priv->mii);
+		if (priv->plat->integrated_phy_power)
+			priv->plat->integrated_phy_power(priv->plat->bsp_priv, true);
 	}
 
 	if (priv->plat->serdes_powerup) {

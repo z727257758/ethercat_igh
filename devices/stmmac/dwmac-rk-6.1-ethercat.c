@@ -25,10 +25,22 @@
 #include <linux/regmap.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/rockchip/rk_vendor_storage.h>
+#include <crypto/hash.h>
 #include <soc/rockchip/rockchip_csu.h>
 #include "stmmac_platform-6.1-ethercat.h"
 
 #define MAX_ETH		2
+
+#define CPU_ID_LEN	8
+#define MD5_LEN		16
+
+extern unsigned int system_serial_high;
+extern unsigned int system_serial_low;
+
+static int ethercat_bus_id = -1;
+module_param_named(bus_id, ethercat_bus_id, int, 0444);
+MODULE_PARM_DESC(bus_id,
+	"Only probe the Rockchip GMAC whose ethernet alias id matches this value.");
 
 struct rk_priv_data;
 struct rk_gmac_ops {
@@ -3041,6 +3053,77 @@ int ethercat_dwmac_rk_get_phy_interface(struct stmmac_priv *priv)
 }
 EXPORT_SYMBOL(ethercat_dwmac_rk_get_phy_interface);
 
+static int rk_md5_hash(const u8 *input, size_t len, u8 *output)
+{
+	struct crypto_shash *tfm;
+	struct shash_desc *shash;
+	int ret;
+
+	tfm = crypto_alloc_shash("md5", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+
+	shash = kzalloc(sizeof(*shash) + crypto_shash_descsize(tfm), GFP_KERNEL);
+	if (!shash) {
+		crypto_free_shash(tfm);
+		return -ENOMEM;
+	}
+
+	shash->tfm = tfm;
+	ret = crypto_shash_digest(shash, input, len, output);
+
+	kfree(shash);
+	crypto_free_shash(tfm);
+
+	return ret;
+}
+
+static int rk_get_eth_addr_from_serial(struct rk_priv_data *bsp_priv,
+				       unsigned char *addr)
+{
+	struct device *dev = &bsp_priv->pdev->dev;
+	u8 cpu_id[CPU_ID_LEN];
+	u8 md5_out[MD5_LEN];
+	int ret;
+
+	if (bsp_priv->id < 0 || bsp_priv->id >= MAX_ETH) {
+		dev_err(dev, "%s: invalid ethernet bus id %d\n",
+			__func__, bsp_priv->id);
+		return -EINVAL;
+	}
+
+	if (!system_serial_high && !system_serial_low)
+		return -ENODATA;
+
+	cpu_id[0] = (system_serial_high >> 24) & 0xff;
+	cpu_id[1] = (system_serial_high >> 16) & 0xff;
+	cpu_id[2] = (system_serial_high >> 8) & 0xff;
+	cpu_id[3] = system_serial_high & 0xff;
+	cpu_id[4] = (system_serial_low >> 24) & 0xff;
+	cpu_id[5] = (system_serial_low >> 16) & 0xff;
+	cpu_id[6] = (system_serial_low >> 8) & 0xff;
+	cpu_id[7] = system_serial_low & 0xff;
+	cpu_id[7] ^= bsp_priv->id;
+
+	ret = rk_md5_hash(cpu_id, sizeof(cpu_id), md5_out);
+	if (ret) {
+		dev_err(dev, "%s: md5 hash failed: %d\n", __func__, ret);
+		return ret;
+	}
+
+	memcpy(addr, md5_out, ETH_ALEN);
+	addr[0] &= ~BIT(0);
+	addr[0] |= BIT(1);
+
+	if (!is_valid_ether_addr(addr)) {
+		dev_err(dev, "%s: generated invalid MAC from CPU serial\n",
+			__func__);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static void rk_get_eth_addr(void *priv, unsigned char *addr)
 {
 	struct rk_priv_data *bsp_priv = priv;
@@ -3049,7 +3132,18 @@ static void rk_get_eth_addr(void *priv, unsigned char *addr)
 	int ret, id = bsp_priv->id;
 
 	if (is_valid_ether_addr(addr))
-		goto out;
+		return;
+
+	ret = rk_get_eth_addr_from_serial(bsp_priv, addr);
+	if (!ret) {
+		dev_info(dev, "%s: fixed MAC from CPU serial: %pM\n",
+			 __func__, addr);
+		return;
+	}
+
+	if (ret != -ENODATA)
+		dev_warn(dev, "%s: fallback to vendor MAC, serial path failed (%d)\n",
+			 __func__, ret);
 
 	if (id < 0 || id >= MAX_ETH) {
 		dev_err(dev, "%s: Invalid ethernet bus id %d\n", __func__, id);
@@ -3078,8 +3172,39 @@ static void rk_get_eth_addr(void *priv, unsigned char *addr)
 		memcpy(addr, &ethaddr[id * ETH_ALEN], ETH_ALEN);
 	}
 
-out:
-	dev_err(dev, "%s: mac address: %pM\n", __func__, addr);
+	dev_info(dev, "%s: vendor MAC: %pM\n", __func__, addr);
+}
+
+static void rk_force_cpu_serial_mac(struct device *dev,
+				    struct rk_priv_data *bsp_priv)
+{
+	struct net_device *ndev = dev_get_drvdata(dev);
+	u8 addr[ETH_ALEN];
+	int ret;
+
+	if (!ndev) {
+		dev_warn(dev, "%s: no net_device found, skip MAC override\n",
+			 __func__);
+		return;
+	}
+
+	ret = rk_get_eth_addr_from_serial(bsp_priv, addr);
+	if (ret) {
+		if (ret != -ENODATA)
+			dev_warn(dev, "%s: failed to generate MAC from CPU serial (%d)\n",
+				 __func__, ret);
+		else
+			dev_warn(dev, "%s: CPU serial not ready, keep current MAC: %pM\n",
+				 __func__, ndev->dev_addr);
+		return;
+	}
+
+	eth_hw_addr_set(ndev, addr);
+	ether_addr_copy(ndev->perm_addr, addr);
+	ndev->addr_assign_type = NET_ADDR_PERM;
+
+	dev_info(dev, "%s: force MAC from CPU serial: %pM\n",
+		 __func__, ndev->dev_addr);
 }
 
 static int rk_gmac_probe(struct platform_device *pdev)
@@ -3087,12 +3212,23 @@ static int rk_gmac_probe(struct platform_device *pdev)
 	struct plat_stmmacenet_data *plat_dat;
 	struct stmmac_resources stmmac_res;
 	const struct rk_gmac_ops *data;
+	int current_bus_id;
+	u8 serial_mac[ETH_ALEN];
 	int ret;
 
 	data = of_device_get_match_data(&pdev->dev);
 	if (!data) {
 		dev_err(&pdev->dev, "no of match data provided\n");
 		return -EINVAL;
+	}
+
+	current_bus_id = of_alias_get_id(pdev->dev.of_node, "ethernet");
+	if (ethercat_bus_id >= 0 && current_bus_id >= 0 &&
+	    current_bus_id != ethercat_bus_id) {
+		dev_info(&pdev->dev,
+			 "skip GMAC probe: ethernet alias id %d does not match requested %d\n",
+			 current_bus_id, ethercat_bus_id);
+		return -ENODEV;
 	}
 
 	ret = ethercat_stmmac_get_platform_resources(pdev, &stmmac_res);
@@ -3121,6 +3257,17 @@ static int rk_gmac_probe(struct platform_device *pdev)
 		goto err_remove_config_dt;
 	}
 
+	ret = rk_get_eth_addr_from_serial(plat_dat->bsp_priv, serial_mac);
+	if (!ret) {
+		ether_addr_copy(stmmac_res.mac, serial_mac);
+		dev_info(&pdev->dev,
+			 "using CPU serial MAC for bus_id=%d: %pM\n",
+			 ((struct rk_priv_data *)plat_dat->bsp_priv)->id,
+			 stmmac_res.mac);
+	} else if (!is_valid_ether_addr(stmmac_res.mac)) {
+		rk_get_eth_addr(plat_dat->bsp_priv, stmmac_res.mac);
+	}
+
 	rk_gmac_csu_init(plat_dat);
 
 	ret = rk_gmac_clk_init(plat_dat);
@@ -3134,6 +3281,8 @@ static int rk_gmac_probe(struct platform_device *pdev)
 	ret = ethercat_stmmac_dvr_probe(&pdev->dev, plat_dat, &stmmac_res);
 	if (ret)
 		goto err_gmac_powerdown;
+
+	rk_force_cpu_serial_mac(&pdev->dev, plat_dat->bsp_priv);
 
 	return 0;
 
