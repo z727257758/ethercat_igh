@@ -80,8 +80,22 @@ ifeq (@HAS_STMMAC_EST@,1)
 	EC_STMMAC_OBJS += stmmac_est-@KERNEL_STMMAC@-ethercat.o
 endif
 
+obj-m += ec_stmmac.o
+ec_stmmac-objs := \
+		$(EC_STMMAC_OBJS) \
+		stmmac_platform-@KERNEL_STMMAC@-ethercat.o \
+		dwmac-rk-@KERNEL_STMMAC@-ethercat.o
+
+obj-m += ec_dwmac-generic.o
+ec_dwmac-generic-objs := \
+		$(EC_STMMAC_OBJS) \
+		stmmac_platform-@KERNEL_STMMAC@-ethercat.o \
+		dwmac-generic-@KERNEL_STMMAC@-ethercat.o
+
 ec_stmmac-$(CONFIG_STMMAC_SELFTESTS) = \
 	stmmac_selftests-@KERNEL_STMMAC@-ethercat.o
+
+	CFLAGS_stmmac_main-@KERNEL_STMMAC@-ethercat.o = -DREV=$(REV)
 
 ifeq (@ENABLE_DWMACINTEL@,1)
 	obj-m += ec_dwmac-intel.o

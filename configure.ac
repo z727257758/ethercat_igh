@@ -674,10 +674,28 @@ AC_SUBST(KERNEL_R8169, [$kernel_r8169])
 AC_SUBST(HAS_R8169_LEDS, [$has_r8169_leds])
 
 #-----------------------------------------------------------------------------
-# stmmac-pci and dwmac-intel driver
+# stmmac driver
 #-----------------------------------------------------------------------------
 
-enablestmmac=0
+AC_ARG_ENABLE([stmmac],
+    AS_HELP_STRING([--enable-stmmac],
+                   [Build stmmac driver [default=no]]),
+    [
+        case "${enableval}" in
+            yes) enablestmmac=1
+                ;;
+            no) enablestmmac=0
+                ;;
+            *) AC_MSG_ERROR([Invalid value for --enable-stmmac])
+                ;;
+        esac
+    ],
+    [enablestmmac=0]
+)
+
+#-----------------------------------------------------------------------------
+# stmmac-pci and dwmac-intel driver
+#-----------------------------------------------------------------------------
 
 AC_ARG_ENABLE([stmmac-pci],
     AS_HELP_STRING([--enable-stmmac-pci],

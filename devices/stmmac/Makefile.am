@@ -50,6 +50,10 @@ EXTRA_DIST = \
 	dwmac-intel-6.1-ethercat.h \
 	dwmac-intel-6.1-orig.c \
 	dwmac-intel-6.1-orig.h \
+	dwmac-generic-6.1-ethercat.c \
+	dwmac-generic-6.1-orig.c \
+	dwmac-rk-6.1-ethercat.c \
+	dwmac-rk-6.1-orig.c \
 	dwmac-intel-6.12-ethercat.c \
 	dwmac-intel-6.12-ethercat.h \
 	dwmac-intel-6.12-orig.c \
@@ -284,6 +288,10 @@ EXTRA_DIST = \
 	stmmac_ptp-6.1-ethercat.h \
 	stmmac_ptp-6.1-orig.c \
 	stmmac_ptp-6.1-orig.h \
+	stmmac_platform-6.1-ethercat.c \
+	stmmac_platform-6.1-ethercat.h \
+	stmmac_platform-6.1-orig.c \
+	stmmac_platform-6.1-orig.h \
 	stmmac_ptp-6.12-ethercat.c \
 	stmmac_ptp-6.12-ethercat.h \
 	stmmac_ptp-6.12-orig.c \

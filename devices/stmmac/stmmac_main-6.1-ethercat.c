@@ -5304,10 +5304,10 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
 			len = 0;
 		}
 
-read_again:
-		if (count >= limit)
+		if ((count >= limit - 1) && limit > 1)
 			break;
 
+read_again:
 		buf1_len = 0;
 		buf2_len = 0;
 		entry = next_entry;
@@ -5343,11 +5343,8 @@ read_again:
 			stmmac_rx_extended_status(priv, &priv->dev->stats,
 					&priv->xstats, rx_q->dma_erx + entry);
 		if (unlikely(status == discard_frame)) {
-			netdev_dbg(priv->dev, "discard frame");
-			if (!get_ecdev(priv)) {
-				page_pool_recycle_direct(rx_q->page_pool, buf->page);
-				buf->page = NULL;
-			}
+			page_pool_recycle_direct(rx_q->page_pool, buf->page);
+			buf->page = NULL;
 			error = 1;
 			if (!priv->hwts_rx_en)
 				priv->dev->stats.rx_errors++;
@@ -5387,23 +5384,7 @@ read_again:
 				len -= ETH_FCS_LEN;
 			}
 		}
-		if (get_ecdev(priv)) {
-			unsigned char *va;
-
-			dma_sync_single_for_cpu(priv->device, buf->addr,
-						buf1_len, dma_dir);
-			va = page_address(buf->page) + buf->page_offset;
-			ecdev_receive(get_ecdev(priv), va, buf1_len);
-			netdev_dbg(priv->dev, "ecdev_receive: %u", buf1_len);
-			priv->ec_watchdog_jiffies = jiffies;
-			/* keep the page and pass it back to the device manually */
-			dma_sync_single_for_device(priv->device, buf->addr,
-							buf1_len, dma_dir);
-			count++;
-			continue;
-		}
-
-		if (!skb) {
+		if (!get_ecdev(priv) && !skb) {
 			unsigned int pre_len, sync_len;
 
 			dma_sync_single_for_cpu(priv->device, buf->addr,
@@ -5455,9 +5436,10 @@ read_again:
 			}
 		}
 
-		if (!skb) {
+		if (!get_ecdev(priv) && !skb) {
 			/* XDP program may expand or reduce tail */
 			buf1_len = xdp.data_end - xdp.data;
+
 			skb = napi_alloc_skb(&ch->rx_napi, buf1_len);
 			if (!skb) {
 				priv->dev->stats.rx_dropped++;
@@ -5471,7 +5453,7 @@ read_again:
 			/* Data payload copied into SKB, page ready for recycle */
 			page_pool_recycle_direct(rx_q->page_pool, buf->page);
 			buf->page = NULL;
-		} else if (buf1_len) {
+		} else if (!get_ecdev(priv) && buf1_len) {
 			dma_sync_single_for_cpu(priv->device, buf->addr,
 						buf1_len, dma_dir);
 			skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
@@ -5483,7 +5465,7 @@ read_again:
 			buf->page = NULL;
 		}
 
-		if (buf2_len) {
+		if (!get_ecdev(priv) && buf2_len) {
 			dma_sync_single_for_cpu(priv->device, buf->sec_addr,
 						buf2_len, dma_dir);
 			skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
@@ -5498,25 +5480,42 @@ read_again:
 drain_data:
 		if (likely(status & rx_not_ls))
 			goto read_again;
-		if (!skb)
+		if (!get_ecdev(priv) && !skb)
 			continue;
 
 		/* Got entire packet into SKB. Finish it. */
 
-		stmmac_get_rx_hwtstamp(priv, p, np, skb);
-		stmmac_rx_vlan(priv->dev, skb);
-		skb->protocol = eth_type_trans(skb, priv->dev);
+		if (!get_ecdev(priv)) {
+			stmmac_get_rx_hwtstamp(priv, p, np, skb);
+			stmmac_rx_vlan(priv->dev, skb);
+			skb->protocol = eth_type_trans(skb, priv->dev);
 
-		if (unlikely(!coe))
-			skb_checksum_none_assert(skb);
-		else
-			skb->ip_summed = CHECKSUM_UNNECESSARY;
+			if (unlikely(!coe))
+				skb_checksum_none_assert(skb);
+			else
+				skb->ip_summed = CHECKSUM_UNNECESSARY;
+		}
 
-		if (!stmmac_get_rx_hash(priv, p, &hash, &hash_type))
+		if (!get_ecdev(priv) && !stmmac_get_rx_hash(priv, p, &hash, &hash_type))
 			skb_set_hash(skb, hash, hash_type);
 
-		skb_record_rx_queue(skb, queue);
-		napi_gro_receive(&ch->rx_napi, skb);
+		if (get_ecdev(priv)) {
+			void *data;
+
+			dma_sync_single_for_cpu(priv->device, buf->addr,
+						buf1_len, DMA_FROM_DEVICE);
+			data = page_address(buf->page);
+
+			/* Data payload copied into SKB, page ready for recycle */
+			page_pool_recycle_direct(rx_q->page_pool, buf->page);
+			buf->page = NULL;
+
+			ecdev_receive(get_ecdev(priv), data, len);
+			priv->ec_watchdog_jiffies = jiffies;
+		} else {
+			skb_record_rx_queue(skb, queue);
+			napi_gro_receive(&ch->rx_napi, skb);
+		}
 		skb = NULL;
 
 		priv->dev->stats.rx_packets++;
@@ -5531,7 +5530,8 @@ drain_data:
 		rx_q->state.len = len;
 	}
 
-	stmmac_finalize_xdp_rx(priv, xdp_status);
+	if (!get_ecdev(priv))
+		stmmac_finalize_xdp_rx(priv, xdp_status);
 
 	stmmac_rx_refill(priv, queue);
 
@@ -5548,8 +5548,6 @@ static int stmmac_napi_poll_rx(struct napi_struct *napi, int budget)
 	struct stmmac_priv *priv = ch->priv_data;
 	u32 chan = ch->index;
 	int work_done;
-
-	BUG_ON(get_ecdev(priv));
 
 	priv->xstats.napi_poll++;
 
@@ -5572,8 +5570,6 @@ static int stmmac_napi_poll_tx(struct napi_struct *napi, int budget)
 	struct stmmac_priv *priv = ch->priv_data;
 	u32 chan = ch->index;
 	int work_done;
-
-	BUG_ON(get_ecdev(priv));
 
 	priv->xstats.napi_poll++;
 
@@ -5598,8 +5594,6 @@ static int stmmac_napi_poll_rxtx(struct napi_struct *napi, int budget)
 	struct stmmac_priv *priv = ch->priv_data;
 	int rx_done, tx_done, rxtx_done;
 	u32 chan = ch->index;
-
-	BUG_ON(get_ecdev(priv));
 
 	priv->xstats.napi_poll++;
 
