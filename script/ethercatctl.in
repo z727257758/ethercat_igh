@@ -35,6 +35,9 @@ fi
 IP="@ipcmd@"
 
 ETHERCAT="@bindir@/ethercat"
+SYSFS_PLATFORM_DRIVERS="/sys/bus/platform/drivers"
+SYSFS_PLATFORM_DEVICES="/sys/bus/platform/devices"
+MODULE_SEARCH_DIRS="/usr/lib/modules /lib/modules"
 
 #------------------------------------------------------------------------------
 
@@ -42,7 +45,11 @@ if [ "$1" = "-c" ]; then
     ETHERCAT_CONFIG="$2"
     COMMAND="$3"
 else
-    ETHERCAT_CONFIG="@sysconfdir@/ethercat.conf"
+    if [ -r "@sysconfdir@/sysconfig/ethercat" ]; then
+        ETHERCAT_CONFIG="@sysconfdir@/sysconfig/ethercat"
+    else
+        ETHERCAT_CONFIG="@sysconfdir@/ethercat.conf"
+    fi
     COMMAND="$1"
 fi
 
@@ -57,16 +64,66 @@ fi
 . ${ETHERCAT_CONFIG}
 
 EC_STMMAC_ARGS=${EC_STMMAC_ARGS:-}
+EC_STMMAC_PLATFORM_DEVICE=${EC_STMMAC_PLATFORM_DEVICE:-}
+EC_STMMAC_PLATFORM_DRIVER=${EC_STMMAC_PLATFORM_DRIVER:-rk_gmac-dwmac-ethercat}
+EC_STMMAC_NATIVE_PLATFORM_DRIVER=${EC_STMMAC_NATIVE_PLATFORM_DRIVER:-rk_gmac-dwmac}
 
 #------------------------------------------------------------------------------
 
 module_exists() {
     if [ -n "${MODINFO}" ] && [ -x "${MODINFO}" ]; then
         ${MODINFO} "$1" > /dev/null 2>&1
-        return $?
+        if [ $? -eq 0 ]; then
+            return 0
+        fi
     fi
 
-    ${MODPROBE} ${MODPROBE_FLAGS} -n "$1" > /dev/null 2>&1
+    if ${MODPROBE} ${MODPROBE_FLAGS} -n "$1" > /dev/null 2>&1; then
+        return 0
+    fi
+
+    find_module_file "$1" > /dev/null 2>&1
+}
+
+#------------------------------------------------------------------------------
+
+find_module_file() {
+    local module="$1"
+    local base
+    local krel
+    local path
+
+    krel=$(uname -r)
+    for base in ${MODULE_SEARCH_DIRS}; do
+        [ -d "${base}/${krel}" ] || continue
+        path=$(find "${base}/${krel}" -type f \( \
+            -name "${module}.ko" -o \
+            -name "${module}.ko.gz" -o \
+            -name "${module}.ko.xz" -o \
+            -name "${module}.ko.zst" \
+        \) 2> /dev/null | head -n 1)
+        if [ -n "${path}" ]; then
+            printf '%s\n' "${path}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#------------------------------------------------------------------------------
+
+load_module() {
+    local module="$1"
+    shift
+    local module_file
+
+    if ${MODPROBE} ${MODPROBE_FLAGS} "${module}" "$@"; then
+        return 0
+    fi
+
+    module_file=$(find_module_file "${module}") || return 1
+    ${MODPROBE} ${MODPROBE_FLAGS} "${module_file}" "$@"
 }
 
 #------------------------------------------------------------------------------
@@ -97,18 +154,129 @@ parse_mac_address() {
 
 #------------------------------------------------------------------------------
 
+use_selective_stmmac_binding() {
+    [ -n "${EC_STMMAC_PLATFORM_DEVICE}" ]
+}
+
+#------------------------------------------------------------------------------
+
+platform_device_exists() {
+    [ -e "${SYSFS_PLATFORM_DEVICES}/$1" ]
+}
+
+#------------------------------------------------------------------------------
+
+platform_driver_loaded() {
+    [ -d "${SYSFS_PLATFORM_DRIVERS}/$1" ]
+}
+
+#------------------------------------------------------------------------------
+
+platform_device_current_driver() {
+    local device="$1"
+    local driver_path
+
+    if [ ! -L "${SYSFS_PLATFORM_DEVICES}/${device}/driver" ]; then
+        return 1
+    fi
+
+    driver_path=$(readlink "${SYSFS_PLATFORM_DEVICES}/${device}/driver") || return 1
+    basename "${driver_path}"
+}
+
+#------------------------------------------------------------------------------
+
+set_platform_driver_override() {
+    local device="$1"
+    local driver="$2"
+
+    printf '%s' "${driver}" > "${SYSFS_PLATFORM_DEVICES}/${device}/driver_override"
+}
+
+#------------------------------------------------------------------------------
+
+clear_platform_driver_override() {
+    local device="$1"
+
+    printf '\n' > "${SYSFS_PLATFORM_DEVICES}/${device}/driver_override"
+}
+
+#------------------------------------------------------------------------------
+
+switch_platform_device_driver() {
+    local device="$1"
+    local target_driver="$2"
+    local current_driver
+
+    if ! platform_device_exists "${device}"; then
+        echo "Platform device ${device} not found." >&2
+        return 1
+    fi
+
+    if ! platform_driver_loaded "${target_driver}"; then
+        echo "Platform driver ${target_driver} not loaded." >&2
+        return 1
+    fi
+
+    set_platform_driver_override "${device}" "${target_driver}" || return 1
+
+    current_driver=$(platform_device_current_driver "${device}" 2>/dev/null || true)
+    if [ -n "${current_driver}" ] && [ "${current_driver}" != "${target_driver}" ]; then
+        printf '%s' "${device}" > "${SYSFS_PLATFORM_DRIVERS}/${current_driver}/unbind" || return 1
+    fi
+
+    current_driver=$(platform_device_current_driver "${device}" 2>/dev/null || true)
+    if [ "${current_driver}" != "${target_driver}" ]; then
+        printf '%s' "${device}" > "${SYSFS_PLATFORM_DRIVERS}/${target_driver}/bind" || return 1
+    fi
+
+    current_driver=$(platform_device_current_driver "${device}" 2>/dev/null || true)
+    if [ "${current_driver}" != "${target_driver}" ]; then
+        echo "Failed to bind ${device} to ${target_driver}." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+#------------------------------------------------------------------------------
+
+switch_stmmac_device_to_ethercat() {
+    switch_platform_device_driver "${EC_STMMAC_PLATFORM_DEVICE}" "${EC_STMMAC_PLATFORM_DRIVER}"
+}
+
+#------------------------------------------------------------------------------
+
+restore_stmmac_device_to_native() {
+    if ! platform_driver_loaded "${EC_STMMAC_NATIVE_PLATFORM_DRIVER}"; then
+        restore_native_stmmac_stack || return 1
+    fi
+
+    switch_platform_device_driver "${EC_STMMAC_PLATFORM_DEVICE}" "${EC_STMMAC_NATIVE_PLATFORM_DRIVER}" || return 1
+    clear_platform_driver_override "${EC_STMMAC_PLATFORM_DEVICE}"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+
+stmmac_native_modules() {
+    echo "dwmac_generic dwmac_rockchip dwmac_rk stmmac_platform stmmac"
+}
+
+#------------------------------------------------------------------------------
+
 unload_native_stmmac_stack() {
     local module
 
-    # Rockchip boards usually bind the native GMAC through dwmac_rk, which in
-    # turn holds stmmac_platform and stmmac. Unload the stack from leaf to root
-    # before inserting ec_stmmac, otherwise the native driver can keep the
-    # device bound and ec_stmmac never takes ownership.
-    for module in dwmac_rk stmmac_platform stmmac; do
+    # Different Rockchip trees expose different native module names
+    # (dwmac_rk vs dwmac_rockchip + dwmac_generic). Unload the whole native
+    # stmmac stack before inserting ec_stmmac, otherwise the native driver can
+    # keep the device bound and ec_stmmac never takes ownership.
+    for module in $(stmmac_native_modules); do
         ${RMMOD} "${module}" 2> /dev/null || true
     done
 
-    for module in dwmac_rk stmmac_platform stmmac; do
+    for module in $(stmmac_native_modules); do
         if ${LSMOD} | grep -q "^${module} "; then
             return 1
         fi
@@ -120,9 +288,18 @@ unload_native_stmmac_stack() {
 #------------------------------------------------------------------------------
 
 restore_native_stmmac_stack() {
-    # dwmac_rk is the board-specific leaf driver and will pull its stmmac
-    # dependencies back in automatically when available.
+    # Different Rockchip kernels may expose either dwmac_rockchip or dwmac_rk
+    # as the board-specific glue driver. Loading either one should pull its
+    # stmmac dependencies back in automatically when available.
+    if ${MODPROBE} ${MODPROBE_FLAGS} dwmac_rockchip 2> /dev/null; then
+        return 0
+    fi
+
     if ${MODPROBE} ${MODPROBE_FLAGS} dwmac_rk 2> /dev/null; then
+        return 0
+    fi
+
+    if ${MODPROBE} ${MODPROBE_FLAGS} dwmac_generic 2> /dev/null; then
         return 0
     fi
 
@@ -172,7 +349,7 @@ start)
     fi
 
     # load master module
-    if ! ${MODPROBE} ${MODPROBE_FLAGS} ec_master \
+    if ! load_module ec_master \
             main_devices="${DEVICES}" backup_devices="${BACKUPS}"; then
         exit 1
     fi
@@ -188,7 +365,7 @@ start)
 
         if [ "${MODULE}" != "generic" ] && [ "${MODULE}" != "ccat" ]; then
             if [ "${MODULE}" = "stmmac" ]; then
-                if ! unload_native_stmmac_stack; then
+                if ! use_selective_stmmac_binding && ! unload_native_stmmac_stack; then
                     ${RMMOD} ${LOADED_MODULES}
                     exit 1
                 fi
@@ -204,10 +381,12 @@ start)
         fi
 
         if [ "${MODULE}" = "stmmac" ] && [ -n "${EC_STMMAC_ARGS}" ]; then
-            if ! ${MODPROBE} ${MODPROBE_FLAGS} "${ECMODULE}" ${EC_STMMAC_ARGS}; then
+            if ! load_module "${ECMODULE}" ${EC_STMMAC_ARGS}; then
                 if [ "${MODULE}" != "generic" ] && [ "${MODULE}" != "ccat" ]; then
                     if [ "${MODULE}" = "stmmac" ]; then
-                        restore_native_stmmac_stack || true
+                        if ! use_selective_stmmac_binding; then
+                            restore_native_stmmac_stack || true
+                        fi
                     else
                         ${MODPROBE} ${MODPROBE_FLAGS} "${MODULE}" # try to restore
                     fi
@@ -215,16 +394,33 @@ start)
                 ${RMMOD} ${LOADED_MODULES}
                 exit 1
             fi
-        elif ! ${MODPROBE} ${MODPROBE_FLAGS} "${ECMODULE}"; then
+            if [ "${MODULE}" = "stmmac" ] && use_selective_stmmac_binding; then
+                if ! switch_stmmac_device_to_ethercat; then
+                    ${RMMOD} "${ECMODULE}" 2> /dev/null || true
+                    ${RMMOD} ${LOADED_MODULES}
+                    exit 1
+                fi
+            fi
+        elif ! load_module "${ECMODULE}"; then
             if [ "${MODULE}" != "generic" ] && [ "${MODULE}" != "ccat" ]; then
                 if [ "${MODULE}" = "stmmac" ]; then
-                    restore_native_stmmac_stack || true
+                    if ! use_selective_stmmac_binding; then
+                        restore_native_stmmac_stack || true
+                    fi
                 else
                     ${MODPROBE} ${MODPROBE_FLAGS} "${MODULE}" # try to restore
                 fi
             fi
             ${RMMOD} ${LOADED_MODULES}
             exit 1
+        fi
+
+        if [ "${MODULE}" = "stmmac" ] && [ -z "${EC_STMMAC_ARGS}" ] && use_selective_stmmac_binding; then
+            if ! switch_stmmac_device_to_ethercat; then
+                ${RMMOD} "${ECMODULE}" 2> /dev/null || true
+                ${RMMOD} ${LOADED_MODULES}
+                exit 1
+            fi
         fi
 
         LOADED_MODULES="${ECMODULE} ${LOADED_MODULES}"
@@ -242,6 +438,11 @@ stop)
         if ! ${LSMOD} | grep -q "^${ECMODULE} "; then
             continue # ec_* module not loaded
         fi
+        if [ "${MODULE}" = "stmmac" ] && use_selective_stmmac_binding; then
+            if ! restore_stmmac_device_to_native; then
+                exit 1
+            fi
+        fi
         if ! ${RMMOD} "${ECMODULE}"; then
             exit 1
         fi;
@@ -255,7 +456,9 @@ stop)
             continue
         fi
         if [ "${MODULE}" = "stmmac" ]; then
-            restore_native_stmmac_stack
+            if ! use_selective_stmmac_binding; then
+                restore_native_stmmac_stack
+            fi
         else
             ${MODPROBE} ${MODPROBE_FLAGS} "${MODULE}"
         fi
